@@ -1,0 +1,34 @@
+[package]
+name = "bee"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["nrf52840-dk"]
+
+nrf52840 = [
+  "embassy-nrf/nrf52840",
+  "nrf-softdevice/nrf52840",
+  "nrf-softdevice/s140",
+  "dep:nrf-softdevice-s140"
+]
+
+nrf52840-dk = ["nrf52840"]
+
+[dependencies]
+embassy-executor = { version = "0.7.0", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"]}
+embassy-time = { version = "0.4.0", features = ["defmt", "defmt-timestamp-uptime"]}
+embassy-sync = { version = "0.6.0" }
+embassy-nrf = { version = "0.3.0", features = ["defmt", "gpiote", "time-driver-rtc1" ]}
+cortex-m-rt = "0.7.3"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features= ["print-defmt"] }
+nrf-softdevice = { version = "0.1.0", features = ["defmt", "ble-peripheral", "ble-central", "critical-section-impl", "ble-gatt-server"] }
+embedded-storage = "0.3.1"
+embedded-storage-async = "0.4.1"
+futures = { version = "0.3.29", default-features = false }
+heapless = "0.8.0"
+atomic-pool = "1.0.1"
+static_cell = "2.0.0"
+nrf-softdevice-s140 = { version = "0.1.2", optional = true }
