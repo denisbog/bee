@@ -17,5 +17,4 @@ readelf -S target/thumbv7em-none-eabihf/release/bee
 
 probe-rs erase --chip nrf52840_xxAA
 probe-rs download --verify --binary-format hex --chip nRF52840_xxAA s140_nrf52_7.3.0_softdevice.hex 
-
 ```

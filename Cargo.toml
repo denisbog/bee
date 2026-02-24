@@ -24,7 +24,7 @@ cortex-m-rt = "0.7.3"
 defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features= ["print-defmt"] }
-nrf-softdevice = { version = "0.1.0", features = ["defmt", "ble-peripheral", "ble-central", "critical-section-impl", "ble-gatt-server"] }
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", branch = "master", features = ["defmt", "ble-peripheral", "ble-central", "critical-section-impl", "ble-gatt-server"] }
 embedded-storage = "0.3.1"
 embedded-storage-async = "0.4.1"
 futures = { version = "0.3.29", default-features = false }
