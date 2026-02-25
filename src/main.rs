@@ -10,7 +10,9 @@ use panic_probe as _;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
+use embassy_nrf::config::Config;
 use embassy_nrf::gpio::Pin;
+use embassy_nrf::interrupt::Priority;
 use embassy_nrf::peripherals::TWISPI0;
 use embassy_nrf::twim::{self, Twim};
 use embassy_time::Duration;
@@ -33,7 +35,7 @@ bind_interrupts!(struct Irqs {
 
 const MAX_SENSORS: usize = 4;
 
-const SENSOR_SERVICE_UUID: u16 = 0x1850;
+const SENSOR_SERVICE_UUID: ServiceUuid16 = ServiceUuid16::BATTERY;
 const MASTER_SERVICE_UUID: u16 = 0x1852;
 
 const TEMP_UUID: u16 = 0x2A1C;
@@ -48,7 +50,7 @@ struct SensorService {
 
 impl SensorService {
     fn register(sd: &mut Softdevice) -> Result<Self, RegisterError> {
-        let mut svc = ServiceBuilder::new(sd, Uuid::new_16(SENSOR_SERVICE_UUID))?;
+        let mut svc = ServiceBuilder::new(sd, Uuid::new_16(SENSOR_SERVICE_UUID.to_u16()))?;
 
         let temp_char = svc.add_characteristic(
             Uuid::new_16(TEMP_UUID),
@@ -174,11 +176,9 @@ async fn run_sensor<SCL: Pin, SDA: Pin>(
     let mut current_humidity: u16 = 0;
 
     static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
+        .full_name("TSensor")
         .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
-        .services_16(
-            ServiceList::Complete,
-            &[ServiceUuid16::from_u16(SENSOR_SERVICE_UUID)],
-        )
+        .services_16(ServiceList::Complete, &[SENSOR_SERVICE_UUID])
         .build();
 
     static SCAN_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new().build();
@@ -287,7 +287,10 @@ async fn run_master(sd: &'static Softdevice, interval_secs: u32) {
 async fn main(spawner: Spawner) {
     info!("Bee Mesh starting...");
 
-    let p = embassy_nrf::init(Default::default());
+    let mut config = Config::default();
+    config.gpiote_interrupt_priority = Priority::P2;
+    config.time_interrupt_priority = Priority::P2;
+    let p = embassy_nrf::init(config);
 
     let config = create_sd_config();
     let mut sd = Softdevice::enable(&config);
@@ -324,8 +327,8 @@ async fn main(spawner: Spawner) {
             device_config.device_id,
             p.TWISPI0,
             Irqs,
-            p.P0_26,
-            p.P0_27,
+            p.P0_06,
+            p.P0_08,
             server,
         )
         .await;

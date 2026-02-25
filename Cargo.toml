@@ -32,3 +32,6 @@ heapless = "0.8.0"
 atomic-pool = "1.0.1"
 static_cell = "2.0.0"
 nrf-softdevice-s140 = { version = "0.1.2", optional = true }
+
+[profile.release]
+debug = 2
