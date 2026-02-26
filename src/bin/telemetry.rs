@@ -19,7 +19,7 @@
 #![no_std]
 #![no_main]
 
-use bee::aht20::{self, Aht20};
+use bee::aht20::Aht20;
 use core::mem;
 use defmt_rtt as _;
 use embassy_nrf::gpio::AnyPin;
@@ -130,13 +130,13 @@ async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
-#[nrf_softdevice::gatt_service(uuid = "180f")]
+#[nrf_softdevice::gatt_service(uuid = "1819")]
 struct TelemetryService {
     #[characteristic(uuid = "2a19", read, notify)]
     battery_level: i16,
-    #[characteristic(uuid = "2a20", read, notify)]
+    #[characteristic(uuid = "2a6e", read, notify)]
     temperature: i16,
-    #[characteristic(uuid = "2a21", read, notify)]
+    #[characteristic(uuid = "2a6f", read, notify)]
     humidity: u16,
 }
 
