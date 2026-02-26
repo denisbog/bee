@@ -165,7 +165,7 @@ async fn run_sensor<SCL: Pin, SDA: Pin>(
     info!("Starting as SENSOR, device_id={}", device_id);
 
     let twi_config = twim::Config::default();
-    let twi = Twim::new(twim, irqs, scl, sda, twi_config);
+    let twi = Twim::new(twim, irqs, sda, scl, twi_config);
 
     let mut aht20 = Aht20::new(twi);
     if let Err(e) = aht20.init() {
