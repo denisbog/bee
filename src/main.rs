@@ -1,180 +1,165 @@
+//! This example showcases how to notify a connected client via BLE of new SAADC data.
+//! Using, for example, nRF-Connect on iOS/Android we can connect to the device "HelloRust"
+//! and see the battery level characteristic getting updated in real-time.
+//!
+//! The SAADC is initialized in single-ended mode and a single measurement is taken every second.
+//! This value is then used to update the battery_level characteristic.
+//! We are using embassy-time for time-keeping purposes.
+//! Everytime a new value is recorded, it gets sent to the connected clients via a GATT Notification.
+//!
+//! The ADC doesn't gather data unless a valid connection exists with a client. This is guaranteed
+//! by using the "select" crate to wait for either the `gatt_server::run` future or the `adc_fut` future
+//! to complete.
+//!
+//! Only a single BLE connection is supported in this example so that RAM usage remains minimal.
+//!
+//! The internal RC oscillator is used to generate the LFCLK.
+//!
+
 #![no_std]
 #![no_main]
-#![macro_use]
 
+use bee::aht20::Aht20;
+use bee::lora::LoraRadio;
 use core::mem;
 use defmt_rtt as _;
-use embassy_nrf as _;
-use panic_probe as _;
+use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive};
+use embassy_nrf::twim::Twim;
+use embassy_nrf::{self as _, spim, twim};
+use panic_probe as _; // time driver // global logger
 
-use defmt::{error, info, warn};
+use defmt::{info, *};
 use embassy_executor::Spawner;
-use embassy_nrf::bind_interrupts;
-use embassy_nrf::config::Config;
-use embassy_nrf::interrupt::Priority;
-use embassy_nrf::peripherals::TWISPI0;
-use embassy_nrf::twim::{self, Twim};
+use embassy_nrf::interrupt::InterruptExt;
+use embassy_nrf::peripherals::{SAADC, SPI3};
+use embassy_nrf::saadc::{AnyInput, Input, Saadc};
+use embassy_nrf::{bind_interrupts, interrupt, saadc};
 use embassy_time::{Duration, Timer};
-use nrf_softdevice::ble::Connection;
-use nrf_softdevice::ble::Uuid;
+use futures::future::{Either, select};
+use futures::pin_mut;
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
-use nrf_softdevice::ble::central;
-use nrf_softdevice::ble::gatt_server::builder::ServiceBuilder;
-use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Properties};
-use nrf_softdevice::ble::gatt_server::{self, RegisterError, WriteOp};
-use nrf_softdevice::ble::peripheral;
+use nrf_softdevice::ble::{Connection, gatt_server, peripheral};
 use nrf_softdevice::{Softdevice, raw};
 
-use bee::aht20::Aht20;
-
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-static mut CONNECTION: Option<Connection> = None;
-static DISCONNECTED: AtomicBool = AtomicBool::new(true);
-
-struct SensorReadings {
-    temperature: i16,
-    humidity: u16,
-}
-
-impl SensorReadings {
-    const fn new() -> Self {
-        Self {
-            temperature: 0,
-            humidity: 0,
-        }
-    }
-}
-
-struct SharedReadings {
-    inner: UnsafeCell<SensorReadings>,
-    notify_temp: UnsafeCell<bool>,
-    notify_humidity: UnsafeCell<bool>,
-}
-
-impl SharedReadings {
-    const fn new() -> Self {
-        Self {
-            inner: UnsafeCell::new(SensorReadings::new()),
-            notify_temp: UnsafeCell::new(false),
-            notify_humidity: UnsafeCell::new(false),
-        }
-    }
-
-    fn set_notify_temp(&self, enabled: bool) {
-        unsafe {
-            *self.notify_temp.get() = enabled;
-        }
-    }
-
-    fn set_notify_humidity(&self, enabled: bool) {
-        unsafe {
-            *self.notify_humidity.get() = enabled;
-        }
-    }
-
-    fn get_notify_temp(&self) -> bool {
-        unsafe { *self.notify_temp.get() }
-    }
-
-    fn get_notify_humidity(&self) -> bool {
-        unsafe { *self.notify_humidity.get() }
-    }
-}
-
-static READINGS: SharedReadings = SharedReadings::new();
-
-unsafe impl Sync for SharedReadings {}
+use embassy_nrf::peripherals::TWISPI0;
 
 bind_interrupts!(struct Irqs {
+    SAADC => saadc::InterruptHandler;
     TWISPI0 => twim::InterruptHandler<TWISPI0>;
+    SPIM3 => spim::InterruptHandler<SPI3>;
 });
 
-const MAX_SENSORS: usize = 4;
-
-const SENSOR_SERVICE_UUID: ServiceUuid16 = ServiceUuid16::BATTERY;
-const MASTER_SERVICE_UUID: u16 = 0x1852;
-
-const TEMP_UUID: u16 = 0x2A1C;
-const HUMIDITY_UUID: u16 = 0x2A1F;
-
-struct SensorService {
-    temp_handle: u16,
-    temp_cccd_handle: u16,
-    humidity_handle: u16,
-    humidity_cccd_handle: u16,
+/// Initializes the SAADC peripheral in single-ended mode on the given pin.
+fn init_adc(adc_pin: AnyInput, adc: SAADC) -> Saadc<'static, 1> {
+    // Then we initialize the ADC. We are only using one channel in this example.
+    let config = saadc::Config::default();
+    let channel_cfg = saadc::ChannelConfig::single_ended(adc_pin.degrade_saadc());
+    interrupt::SAADC.set_priority(interrupt::Priority::P3);
+    let saadc = saadc::Saadc::new(adc, Irqs, config, [channel_cfg]);
+    saadc
 }
 
-impl SensorService {
-    fn register(sd: &mut Softdevice) -> Result<Self, RegisterError> {
-        let mut svc = ServiceBuilder::new(sd, Uuid::new_16(SENSOR_SERVICE_UUID.to_u16()))?;
+// source: https://github.com/embassy-rs/embassy/blob/main/examples/nrf52840/src/bin/twim.rs
+fn init_aht(scl: AnyPin, sda: AnyPin, twispi0: TWISPI0) -> Aht20<'static, TWISPI0> {
+    let twi_config = twim::Config::default();
+    interrupt::TWISPI0.set_priority(interrupt::Priority::P3);
+    let twi = Twim::new(twispi0, Irqs, sda, scl, twi_config);
 
-        let temp_char = svc.add_characteristic(
-            Uuid::new_16(TEMP_UUID),
-            Attribute::new(&[0u8, 0u8]),
-            Metadata::new(Properties::new().read().notify()),
-        )?;
-        let temp_handles = temp_char.build();
-        let temp_handle = temp_handles.value_handle;
-        let temp_cccd_handle = temp_handles.cccd_handle;
+    let mut aht20 = Aht20::new(twi);
+    if let Err(e) = aht20.init() {
+        warn!("AHT20 init failed: {:?}", e);
+    }
+    aht20
+}
+// source: https://github.com/embassy-rs/embassy/blob/main/examples/nrf52840/src/bin/spim.rs
+fn init_lora<'a>(
+    nss: Output<'a>,
+    reset: Output<'a>,
+    sck: AnyPin,
+    miso: AnyPin,
+    mosi: AnyPin,
+    spi3: SPI3,
+) -> LoraRadio<'a, SPI3> {
+    let config = spim::Config::default();
+    interrupt::SPIM3.set_priority(interrupt::Priority::P3);
+    // config.frequency = spim::Frequency::M16;
 
-        let humidity_char = svc.add_characteristic(
-            Uuid::new_16(HUMIDITY_UUID),
-            Attribute::new(&[0u8, 0u8]),
-            Metadata::new(Properties::new().read().notify()),
-        )?;
-        let humidity_handles = humidity_char.build();
-        let humidity_handle = humidity_handles.value_handle;
-        let humidity_cccd_handle = humidity_handles.cccd_handle;
+    let spim = spim::Spim::new(spi3, Irqs, sck, miso, mosi, config);
 
-        svc.build();
+    let mut lora = LoraRadio::new(nss, reset, spim).unwrap();
+    if let Err(e) = lora.init() {
+        warn!("Lora init failed: {:?}", e);
+    } else {
+        lora.setup();
+    }
+    lora
+}
 
-        Ok(Self {
-            temp_handle,
-            temp_cccd_handle,
-            humidity_handle,
-            humidity_cccd_handle,
-        })
+/// Reads the current ADC value every second and notifies the connected client.
+async fn notify_adc_value<'a>(
+    saadc: &'a mut Saadc<'_, 1>,
+    server: &'a Server,
+    connection: &'a Connection,
+) {
+    loop {
+        let mut buf = [0i16; 1];
+        saadc.sample(&mut buf).await;
+
+        // We only sampled one ADC channel.
+        let adc_raw_value: i16 = buf[0];
+
+        // Try and notify the connected client of the new ADC value.
+        match server.ts.battery_level_notify(connection, &adc_raw_value) {
+            Ok(_) => info!("Battery adc_raw_value: {=i16}", &adc_raw_value),
+            Err(_) => unwrap!(server.ts.battery_level_set(&adc_raw_value)),
+        };
+
+        // Sleep for one second.
+        Timer::after(Duration::from_secs(1)).await
     }
 }
 
-struct Server {
-    sensor: SensorService,
-}
+async fn notify_temperature_value<'a>(
+    aht20: &'a mut Aht20<'static, TWISPI0>,
+    server: &'a Server,
+    connection: &'a Connection,
+) {
+    loop {
+        if let Ok(reading) = aht20.read() {
+            let temp = (reading.temperature * 100.0) as i16;
+            let humidity = (reading.humidity * 100.0) as u16;
 
-impl Server {
-    fn new(sd: &mut Softdevice) -> Result<Self, RegisterError> {
-        let sensor = SensorService::register(sd)?;
-        Ok(Self { sensor })
-    }
-}
-
-impl gatt_server::Server for Server {
-    type Event = ();
-
-    fn on_write(
-        &self,
-        _conn: &Connection,
-        handle: u16,
-        _op: WriteOp,
-        _offset: usize,
-        data: &[u8],
-    ) -> Option<Self::Event> {
-        if handle == self.sensor.temp_cccd_handle {
-            info!("Temp CCCD written: {:?}", data);
-            if data.len() >= 2 && (data[1] & 0x01) != 0 {
-                READINGS.set_notify_temp(true);
-            }
-        } else if handle == self.sensor.humidity_cccd_handle {
-            info!("Humidity CCCD written: {:?}", data);
-            if data.len() >= 2 && (data[1] & 0x01) != 0 {
-                READINGS.set_notify_humidity(true);
-            }
+            info!(
+                "Sensor reading: {}°C, {}%",
+                reading.temperature, reading.humidity
+            );
+            // Try and notify the connected client of the new ADC value.
+            match server.ts.temperature_notify(connection, &temp) {
+                Ok(_) => info!("Temperature: {=i16}", &temp),
+                Err(_) => unwrap!(server.ts.temperature_set(&temp)),
+            };
+            match server.ts.humidity_notify(connection, &humidity) {
+                Ok(_) => info!("Humidity: {=u16}", &humidity),
+                Err(_) => unwrap!(server.ts.humidity_set(&humidity)),
+            };
         }
-        None
+        // Sleep for one second.
+        Timer::after(Duration::from_secs(1)).await
+    }
+}
+
+async fn notify_lora_value<'a>(
+    lora: &'a mut LoraRadio<'static, SPI3>,
+    _server: &'a Server,
+    _connection: &'a Connection,
+) {
+    loop {
+        lora.write();
+        info!("lora write");
+        // Sleep for one second.
+        Timer::after(Duration::from_secs(10)).await
     }
 }
 
@@ -183,92 +168,58 @@ async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
-#[allow(static_mut_refs)]
-#[embassy_executor::task]
-async fn gatt_server_run(sd: &'static Softdevice, temp_handle: u16, humidity_handle: u16) {
-    let mut last_temp: i16 = 0;
-    let mut last_humidity: u16 = 0;
-
-    loop {
-        Timer::after(Duration::from_secs(2)).await;
-
-        if DISCONNECTED.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let readings = unsafe { &*READINGS.inner.get() };
-        let notify_temp = READINGS.get_notify_temp();
-        let notify_humidity = READINGS.get_notify_humidity();
-
-        if let Some(conn) = unsafe { CONNECTION.as_ref() } {
-            if readings.temperature != last_temp {
-                let _ =
-                    gatt_server::set_value(sd, temp_handle, &readings.temperature.to_le_bytes());
-                if notify_temp {
-                    let _ = gatt_server::notify_value(
-                        conn,
-                        temp_handle,
-                        &readings.temperature.to_le_bytes(),
-                    );
-                }
-                last_temp = readings.temperature;
-            }
-
-            if readings.humidity != last_humidity {
-                let _ =
-                    gatt_server::set_value(sd, humidity_handle, &readings.humidity.to_le_bytes());
-                if notify_humidity {
-                    let _ = gatt_server::notify_value(
-                        conn,
-                        humidity_handle,
-                        &readings.humidity.to_le_bytes(),
-                    );
-                }
-                last_humidity = readings.humidity;
-            }
-        }
-    }
+#[nrf_softdevice::gatt_service(uuid = "1819")]
+struct TelemetryService {
+    #[characteristic(uuid = "2a19", read, notify)]
+    battery_level: i16,
+    #[characteristic(uuid = "2a6e", read, notify)]
+    temperature: i16,
+    #[characteristic(uuid = "2a6f", read, notify)]
+    humidity: u16,
 }
 
-#[embassy_executor::task]
-async fn sensor_reading_task(
-    twim: TWISPI0,
-    irqs: Irqs,
-    scl: embassy_nrf::peripherals::P0_06,
-    sda: embassy_nrf::peripherals::P0_08,
-    readings: &'static SharedReadings,
-) {
-    let twi_config = twim::Config::default();
-    let twi = Twim::new(twim, irqs, sda, scl, twi_config);
-
-    let mut aht20 = Aht20::new(twi);
-    if let Err(e) = aht20.init() {
-        warn!("AHT20 init failed: {:?}", e);
-    }
-
-    loop {
-        Timer::after(Duration::from_secs(10)).await;
-
-        if let Ok(reading) = aht20.read() {
-            let temp = (reading.temperature * 100.0) as i16;
-            let humidity = (reading.humidity * 100.0) as u16;
-
-            unsafe {
-                let r = &mut *readings.inner.get();
-                r.temperature = temp;
-                r.humidity = humidity;
-            }
-
-            info!(
-                "Sensor reading: {}°C, {}%",
-                reading.temperature, reading.humidity
-            );
-        }
-    }
+#[nrf_softdevice::gatt_server]
+struct Server {
+    ts: TelemetryService,
 }
 
-fn create_sd_config() -> nrf_softdevice::Config {
-    nrf_softdevice::Config {
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    info!("Telemetry Service!");
+
+    // First we get the peripherals access crate.
+    let mut config = embassy_nrf::config::Config::default();
+    config.gpiote_interrupt_priority = interrupt::Priority::P2;
+    config.time_interrupt_priority = interrupt::Priority::P2;
+    let p = embassy_nrf::init(config);
+
+    // Then we initialize the ADC. We are only using one channel in this example.
+    let adc_pin = p.P0_29.degrade_saadc();
+
+    let scl = p.P0_06;
+    let sda = p.P0_08;
+
+    let mut saadc = init_adc(adc_pin, p.SAADC);
+    let mut aht20 = init_aht(scl.into(), sda.into(), p.TWISPI0);
+
+    let spi_nss = Output::new(p.P1_04, Level::High, OutputDrive::Standard);
+    let spi_reset = Output::new(p.P1_06, Level::High, OutputDrive::Standard);
+    let spi_sck = p.P0_20;
+    let spi_miso = p.P0_22;
+    let spi_mosi = p.P0_24;
+
+    let mut lora = init_lora(
+        spi_nss,
+        spi_reset,
+        spi_sck.into(),
+        spi_miso.into(),
+        spi_mosi.into(),
+        p.SPI3,
+    );
+    // Indicated: wait for ADC calibration.
+    saadc.calibrate().await;
+
+    let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
             source: raw::NRF_CLOCK_LF_SRC_RC as u8,
             rc_ctiv: 16,
@@ -276,7 +227,7 @@ fn create_sd_config() -> nrf_softdevice::Config {
             accuracy: raw::NRF_CLOCK_LF_ACCURACY_500_PPM as u8,
         }),
         conn_gap: Some(raw::ble_gap_conn_cfg_t {
-            conn_count: (MAX_SENSORS + 1) as u8,
+            conn_count: 1,
             event_length: 24,
         }),
         conn_gatt: Some(raw::ble_gatt_conn_cfg_t { att_mtu: 256 }),
@@ -284,189 +235,93 @@ fn create_sd_config() -> nrf_softdevice::Config {
             attr_tab_size: raw::BLE_GATTS_ATTR_TAB_SIZE_DEFAULT,
         }),
         gap_role_count: Some(raw::ble_gap_cfg_role_count_t {
-            adv_set_count: 1,
-            periph_role_count: 1,
-            central_role_count: 1,
+            adv_set_count: raw::BLE_GAP_ADV_SET_COUNT_DEFAULT as u8,
+            periph_role_count: raw::BLE_GAP_ROLE_COUNT_PERIPH_DEFAULT as u8,
+            central_role_count: 0,
             central_sec_count: 0,
             _bitfield_1: raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
         }),
         gap_device_name: Some(raw::ble_gap_cfg_device_name_t {
-            p_value: b"BeeMesh" as *const u8 as _,
-            current_len: 7,
-            max_len: 7,
+            p_value: b"TelemetryService" as *const u8 as _,
+            current_len: 16,
+            max_len: 16,
             write_perm: unsafe { mem::zeroed() },
             _bitfield_1: raw::ble_gap_cfg_device_name_t::new_bitfield_1(
                 raw::BLE_GATTS_VLOC_STACK as u8,
             ),
         }),
         ..Default::default()
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_sensor(
-    sd: &'static Softdevice,
-    device_id: u8,
-    twim: TWISPI0,
-    irqs: Irqs,
-    scl: embassy_nrf::peripherals::P0_06,
-    sda: embassy_nrf::peripherals::P0_08,
-    server: Server,
-    spawner: Spawner,
-) {
-    info!("Starting as SENSOR, device_id={}", device_id);
-
-    if spawner
-        .spawn(sensor_reading_task(twim, irqs, scl, sda, &READINGS))
-        .is_err()
-    {
-        warn!("Failed to spawn sensor reading task");
-    }
-
-    static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
-        .full_name("TSensor")
-        .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
-        .services_16(ServiceList::Complete, &[SENSOR_SERVICE_UUID])
-        .build();
-
-    static SCAN_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new().build();
-
-    let temp_handle = server.sensor.temp_handle;
-    let humidity_handle = server.sensor.humidity_handle;
-
-    loop {
-        info!("Advertising as sensor...");
-        let config = peripheral::Config::default();
-        let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
-            adv_data: &ADV_DATA,
-            scan_data: &SCAN_DATA,
-        };
-
-        match peripheral::advertise_connectable(sd, adv, &config).await {
-            Ok(conn) => {
-                info!("Master connected!");
-                DISCONNECTED.store(false, Ordering::Relaxed);
-
-                let conn_ref = &conn;
-                unsafe { CONNECTION = Some(core::ptr::read(conn_ref)) };
-                spawner
-                    .spawn(gatt_server_run(sd, temp_handle, humidity_handle))
-                    .ok();
-                gatt_server::run(&conn, &server, |_| {}).await;
-                unsafe { CONNECTION = None };
-                DISCONNECTED.store(true, Ordering::Relaxed);
-
-                info!("Master disconnected");
-            }
-            Err(e) => {
-                warn!("Advertising failed: {:?}", e);
-            }
-        }
-    }
-}
-
-async fn run_master(sd: &'static Softdevice, interval_secs: u32) {
-    info!("Starting as MASTER");
-
-    static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
-        .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
-        .services_16(
-            ServiceList::Complete,
-            &[ServiceUuid16::from_u16(MASTER_SERVICE_UUID)],
-        )
-        .full_name("BeeMaster")
-        .build();
-
-    static SCAN_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new().build();
-
-    loop {
-        info!("Advertising as master...");
-
-        let config = peripheral::Config::default();
-        let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
-            adv_data: &ADV_DATA,
-            scan_data: &SCAN_DATA,
-        };
-
-        match peripheral::advertise_connectable(sd, adv, &config).await {
-            Ok(_conn) => {
-                info!("Sensor connected!");
-            }
-            Err(e) => {
-                warn!("Advertising failed: {:?}", e);
-            }
-        }
-
-        info!("Scanning for sensors...");
-
-        let scan_config = central::ScanConfig::default();
-        let mut found_count = 0;
-
-        let _ = central::scan(sd, &scan_config, |_report| {
-            found_count += 1;
-            info!("Found sensor #{}", found_count);
-            Some(())
-        })
-        .await;
-
-        info!(
-            "Scan complete. Found {} sensors. Waiting {}s...",
-            found_count, interval_secs
-        );
-        Timer::after(Duration::from_secs(interval_secs as u64)).await;
-    }
-}
-
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    info!("Bee Mesh starting...");
-
-    let mut config = Config::default();
-    config.gpiote_interrupt_priority = Priority::P2;
-    config.time_interrupt_priority = Priority::P2;
-    let p = embassy_nrf::init(config);
-
-    let config = create_sd_config();
-    let mut sd = Softdevice::enable(&config);
-
-    let device_config = bee::config::ConfigStorage::load();
-    info!(
-        "Loaded config: role={}, device_id={}, interval={}",
-        device_config.role, device_config.device_id, device_config.interval_secs
-    );
-
-    #[allow(clippy::needless_borrow)]
-    let server = if !device_config.is_master() {
-        match Server::new(&mut sd) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                error!("Failed to register GATT server: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
     };
 
-    let sd: &'static Softdevice = unsafe { &*(core::ptr::addr_of!(sd) as *const Softdevice) };
+    let sd = Softdevice::enable(&config);
+    let server = unwrap!(Server::new(sd));
 
-    if spawner.spawn(softdevice_task(sd)).is_err() {
-        warn!("Failed to spawn softdevice task");
-    }
+    unwrap!(spawner.spawn(softdevice_task(sd)));
 
-    if device_config.is_master() {
-        run_master(sd, device_config.interval_secs).await;
-    } else if let Some(server) = server {
-        run_sensor(
-            sd,
-            device_config.device_id,
-            p.TWISPI0,
-            Irqs,
-            p.P0_06,
-            p.P0_08,
-            server,
-            spawner,
-        )
-        .await;
+    static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
+        .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
+        .services_16(ServiceList::Complete, &[ServiceUuid16::BATTERY])
+        .full_name("Telemetry Service")
+        .build();
+
+    static SCAN_DATA: [u8; 0] = [];
+
+    loop {
+        let config = peripheral::Config::default();
+
+        let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
+            adv_data: &ADV_DATA,
+            scan_data: &SCAN_DATA,
+        };
+        let conn = unwrap!(peripheral::advertise_connectable(sd, adv, &config).await);
+        info!("advertising done! I have a connection.");
+
+        // We have a GATT connection. Now we will create two futures:
+        //  - An infinite loop gathering data from the ADC and notifying the clients.
+        //  - A GATT server listening for events from the connected client.
+        //
+        // Event enums (ServerEvent's) are generated by nrf_softdevice::gatt_server
+        // proc macro when applied to the Server struct above
+        // let adc_fut = notify_adc_value(&mut saadc, &server, &conn);
+
+        let adc_fut = notify_adc_value(&mut saadc, &server, &conn);
+        let aht20_fut = notify_temperature_value(&mut aht20, &server, &conn);
+        let lora_fut = notify_lora_value(&mut lora, &server, &conn);
+
+        let gatt_fut = gatt_server::run(&conn, &server, |e| match e {
+            ServerEvent::Ts(e) => match e {
+                TelemetryServiceEvent::BatteryLevelCccdWrite { notifications } => {
+                    info!("battery notifications: {}", notifications)
+                }
+                TelemetryServiceEvent::TemperatureCccdWrite { notifications } => {
+                    info!("temperature notifications: {}", notifications)
+                }
+                TelemetryServiceEvent::HumidityCccdWrite { notifications } => {
+                    info!("humidity notifications: {}", notifications)
+                }
+            },
+        });
+
+        pin_mut!(adc_fut);
+        pin_mut!(aht20_fut);
+        pin_mut!(lora_fut);
+        pin_mut!(gatt_fut);
+        // We are using "select" to wait for either one of the futures to complete.
+        // There are some advantages to this approach:
+        //  - we only gather data when a client is connected, therefore saving some power.
+        //  - when the GATT server finishes operating, our ADC future is also automatically aborted.
+
+        let _result = match select(select(select(adc_fut, aht20_fut), lora_fut), gatt_fut).await {
+            Either::Left((Either::Left((Either::Left((r, _)), _)), _)) => {
+                info!("ADC encountered an error and stopped! {:?}", r)
+            }
+            Either::Left((Either::Left((Either::Right((r, _)), _)), _)) => {
+                info!("Data service encountered an error and stopped! {:?}", r)
+            }
+            Either::Left((Either::Right((r, _)), _)) => {
+                info!("lora run exited with error: {:?}", r)
+            }
+            Either::Right((r, _)) => info!("gatt_server run exited with error: {:?}", r),
+        };
     }
 }
