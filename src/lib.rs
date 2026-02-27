@@ -2,3 +2,4 @@
 
 pub mod aht20;
 pub mod config;
+pub mod lora;

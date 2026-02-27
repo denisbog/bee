@@ -20,17 +20,18 @@
 #![no_main]
 
 use bee::aht20::Aht20;
+use bee::lora::LoraRadio;
 use core::mem;
 use defmt_rtt as _;
-use embassy_nrf::gpio::AnyPin;
+use embassy_nrf::gpio::{AnyPin, Level, Output, OutputDrive};
 use embassy_nrf::twim::Twim;
-use embassy_nrf::{self as _, twim};
+use embassy_nrf::{self as _, spim, twim};
 use panic_probe as _; // time driver // global logger
 
 use defmt::{info, *};
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::InterruptExt;
-use embassy_nrf::peripherals::SAADC;
+use embassy_nrf::peripherals::{SAADC, SPI3};
 use embassy_nrf::saadc::{AnyInput, Input, Saadc};
 use embassy_nrf::{bind_interrupts, interrupt, saadc};
 use embassy_time::{Duration, Timer};
@@ -47,6 +48,7 @@ use embassy_nrf::peripherals::TWISPI0;
 bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
     TWISPI0 => twim::InterruptHandler<TWISPI0>;
+    SPIM3 => spim::InterruptHandler<SPI3>;
 });
 
 /// Initializes the SAADC peripheral in single-ended mode on the given pin.
@@ -58,6 +60,8 @@ fn init_adc(adc_pin: AnyInput, adc: SAADC) -> Saadc<'static, 1> {
     let saadc = saadc::Saadc::new(adc, Irqs, config, [channel_cfg]);
     saadc
 }
+
+// source: https://github.com/embassy-rs/embassy/blob/main/examples/nrf52840/src/bin/twim.rs
 fn init_aht(scl: AnyPin, sda: AnyPin, twispi0: TWISPI0) -> Aht20<'static, TWISPI0> {
     let twi_config = twim::Config::default();
     interrupt::TWISPI0.set_priority(interrupt::Priority::P3);
@@ -67,8 +71,30 @@ fn init_aht(scl: AnyPin, sda: AnyPin, twispi0: TWISPI0) -> Aht20<'static, TWISPI
     if let Err(e) = aht20.init() {
         warn!("AHT20 init failed: {:?}", e);
     }
-
     aht20
+}
+// source: https://github.com/embassy-rs/embassy/blob/main/examples/nrf52840/src/bin/spim.rs
+fn init_lora<'a>(
+    nss: Output<'a>,
+    reset: Output<'a>,
+    sck: AnyPin,
+    miso: AnyPin,
+    mosi: AnyPin,
+    spi3: SPI3,
+) -> LoraRadio<'a, SPI3> {
+    let config = spim::Config::default();
+    interrupt::SPIM3.set_priority(interrupt::Priority::P3);
+    // config.frequency = spim::Frequency::M16;
+
+    let spim = spim::Spim::new(spi3, Irqs, sck, miso, mosi, config);
+
+    let mut lora = LoraRadio::new(nss, reset, spim).unwrap();
+    if let Err(e) = lora.init() {
+        warn!("Lora init failed: {:?}", e);
+    } else {
+        lora.setup();
+    }
+    lora
 }
 
 /// Reads the current ADC value every second and notifies the connected client.
@@ -119,9 +145,21 @@ async fn notify_temperature_value<'a>(
                 Err(_) => unwrap!(server.ts.humidity_set(&humidity)),
             };
         }
-
         // Sleep for one second.
         Timer::after(Duration::from_secs(1)).await
+    }
+}
+
+async fn notify_lora_value<'a>(
+    lora: &'a mut LoraRadio<'static, SPI3>,
+    _server: &'a Server,
+    _connection: &'a Connection,
+) {
+    loop {
+        lora.write();
+        info!("lora write");
+        // Sleep for one second.
+        Timer::after(Duration::from_secs(10)).await
     }
 }
 
@@ -163,6 +201,21 @@ async fn main(spawner: Spawner) {
 
     let mut saadc = init_adc(adc_pin, p.SAADC);
     let mut aht20 = init_aht(scl.into(), sda.into(), p.TWISPI0);
+
+    let spi_nss = Output::new(p.P1_04, Level::High, OutputDrive::Standard);
+    let spi_reset = Output::new(p.P1_06, Level::High, OutputDrive::Standard);
+    let spi_sck = p.P0_20;
+    let spi_miso = p.P0_22;
+    let spi_mosi = p.P0_24;
+
+    let mut lora = init_lora(
+        spi_nss,
+        spi_reset,
+        spi_sck.into(),
+        spi_miso.into(),
+        spi_mosi.into(),
+        p.SPI3,
+    );
     // Indicated: wait for ADC calibration.
     saadc.calibrate().await;
 
@@ -233,6 +286,7 @@ async fn main(spawner: Spawner) {
 
         let adc_fut = notify_adc_value(&mut saadc, &server, &conn);
         let aht20_fut = notify_temperature_value(&mut aht20, &server, &conn);
+        let lora_fut = notify_lora_value(&mut lora, &server, &conn);
 
         let gatt_fut = gatt_server::run(&conn, &server, |e| match e {
             ServerEvent::Ts(e) => match e {
@@ -250,20 +304,24 @@ async fn main(spawner: Spawner) {
 
         pin_mut!(adc_fut);
         pin_mut!(aht20_fut);
+        pin_mut!(lora_fut);
         pin_mut!(gatt_fut);
         // We are using "select" to wait for either one of the futures to complete.
         // There are some advantages to this approach:
         //  - we only gather data when a client is connected, therefore saving some power.
         //  - when the GATT server finishes operating, our ADC future is also automatically aborted.
 
-        let _result = match select(select(adc_fut, aht20_fut), gatt_fut).await {
-            Either::Left((Either::Left((r, _)), _)) => {
+        let _result = match select(select(select(adc_fut, aht20_fut), lora_fut), gatt_fut).await {
+            Either::Left((Either::Left((Either::Left((r, _)), _)), _)) => {
                 info!("ADC encountered an error and stopped! {:?}", r)
             }
-            Either::Left((Either::Right((r, _)), _)) => {
+            Either::Left((Either::Left((Either::Right((r, _)), _)), _)) => {
                 info!("Data service encountered an error and stopped! {:?}", r)
             }
-            Either::Right((e, _)) => info!("gatt_server run exited with error: {:?}", e),
+            Either::Left((Either::Right((r, _)), _)) => {
+                info!("lora run exited with error: {:?}", r)
+            }
+            Either::Right((r, _)) => info!("gatt_server run exited with error: {:?}", r),
         };
     }
 }
