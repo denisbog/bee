@@ -80,9 +80,9 @@ async fn main(_spawner: Spawner) {
         let voltage = 3.3;
 
         // lora.write_meshtastic_telemetry(temp_celsius, humidity_percent, voltage, packet_id);
-        lora.write();
+        lora.write().await;
         packet_id = packet_id.wrapping_add(1);
 
-        Timer::after(Duration::from_secs(30)).await;
+        Timer::after(Duration::from_secs(5)).await;
     }
 }

@@ -156,7 +156,7 @@ async fn notify_lora_value<'a>(
     _connection: &'a Connection,
 ) {
     loop {
-        lora.write();
+        lora.write().await;
         info!("lora write");
         // Sleep for one second.
         Timer::after(Duration::from_secs(10)).await

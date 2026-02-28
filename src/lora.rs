@@ -4,6 +4,7 @@ use embassy_nrf::{
     gpio::Output,
     spim::{Instance, Spim},
 };
+use embassy_time::{Duration, Timer};
 use meshtastic_protobufs::MeshPacket;
 use prost::Message;
 pub mod meshtastic {
@@ -129,31 +130,27 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         info!("TX complete");
     }
 
-    pub fn write(&mut self) {
-        let packet_count = 1;
-        info!("TX packet #{}", packet_count);
-        let mut packet_data = [0u8; 16];
-
+    pub async fn write(&mut self) {
         let packet = MeshPacket {
             from: 11,
-            to: 445566,
+            to: 0xFFFFFFFF,
             channel: 0,
             id: 11,
-            rx_time: 1,
+            rx_time: 0,
             rx_snr: 1.0,
-            hop_limit: 1,
+            hop_limit: 0,
             want_ack: false,
-            priority: 1,
+            priority: 0,
             rx_rssi: 1,
-            delayed: 1,
+            delayed: 0,
             via_mqtt: false,
-            hop_start: 1,
+            hop_start: 0,
             public_key: vec![],
             pki_encrypted: true,
-            next_hop: 1,
-            relay_node: 1,
-            tx_after: 1,
-            transport_mechanism: 1,
+            next_hop: 0,
+            relay_node: 0,
+            tx_after: 0,
+            transport_mechanism: 0,
             payload_variant: None,
         };
 
@@ -161,8 +158,8 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             &mut self.spi,
             &mut self.nss,
             packet.encode_to_vec().as_slice(),
-        );
-        info!("TX packet #{}.done", packet_count);
+        )
+        .await;
     }
 
     pub fn start_rx(&mut self) {
@@ -266,47 +263,37 @@ fn delay(delay: u64) {
     embassy_time::block_for(embassy_time::Duration::from_micros(delay));
 }
 
-fn tx_packet<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>, data: &[u8]) {
-    info!("TX packet .1");
+async fn tx_packet<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>, data: &[u8]) {
     spi_write(spi, nss, REG_FIFO_ADDR_PTR, 0);
 
-    info!("TX packet .2");
     nss.set_low();
-    info!("TX packet .3");
     spi.blocking_write(&[REG_FIFO_ADDR_PTR as u8 | 0x80]).ok();
-    info!("TX packet .4");
     spi.blocking_write(data).ok();
-    info!("TX packet .5");
     nss.set_high();
 
-    info!("TX packet .5");
     spi_write(spi, nss, REG_PAYLOAD_LENGTH, data.len() as u8);
 
-    info!("TX packet .6");
     spi_write(spi, nss, REG_OP_MODE, MODE_LONG_RANGE | MODE_TX);
 
-    info!("TX packet .7");
-    wait_tx_done(spi, nss);
-    info!("TX packet .8");
+    wait_tx_done(spi, nss).await;
 }
 
-fn wait_tx_done<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>) {
-    let mut retry = 3;
+async fn wait_tx_done<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>) {
+    let mut retries = 0;
     loop {
-        if retry < 0 {
-            error!("failed to transmit the data");
-            break;
-        } else {
-            info!("retries left {}", retry);
-            retry -= 1;
-        }
         let irq_flags = spi_read(spi, nss, REG_IRQ_FLAGS);
         if irq_flags & IRQ_TX_DONE != 0 {
-            info!("done transmiting {} {}", irq_flags, irq_flags & IRQ_TX_DONE);
+            info!(
+                "done transmiting {:#010b} in {} retries",
+                irq_flags, retries
+            );
             spi_write(spi, nss, REG_IRQ_FLAGS, IRQ_TX_DONE);
             break;
         } else {
-            info!("retries left {} flag {}", retry, irq_flags);
+            //device busy wait
+            Timer::after(Duration::from_millis(500)).await;
+            // delay(100_000);
+            retries += 1;
         }
     }
 }
