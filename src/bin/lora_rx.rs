@@ -10,7 +10,7 @@ use embassy_nrf::{self as _, interrupt, spim};
 use nrf_softdevice as _;
 use panic_probe as _;
 
-use defmt::info;
+use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::config::Config;
@@ -46,7 +46,7 @@ fn init_lora<'a>(
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     bee::init_heap();
-    info!("Bee Mesh starting...");
+    info!("Bee Mesh RX starting...");
 
     let mut config = Config::default();
     config.gpiote_interrupt_priority = Priority::P2;
@@ -68,21 +68,38 @@ async fn main(_spawner: Spawner) {
         p.SPI3,
     );
 
-    let mut packet_id: u32 = 1;
-    let mut count: u32 = 0;
+    lora.start_rx();
+    info!("Listening for incoming packets...");
+
+    let mut buffer = [0u8; 256];
+    let mut packet_count: u32 = 0;
 
     loop {
-        count += 1;
-        info!("Sending telemetry packet #{}", count);
+        if let Some(len) = lora.receive(&mut buffer) {
+            packet_count += 1;
+            info!("=== Packet #{} ({} bytes) ===", packet_count, len);
 
-        let temp_celsius = 23.5 + (count as f32 * 0.1);
-        let humidity_percent = 65.0 + (count as f32 * 0.5);
-        let voltage = 3.3;
+            info!("Hex: ");
+            // for (i, &byte) in buffer[..len].iter().enumerate() {
+            //     if i > 0 && i % 16 == 0 {
+            //         defmt::info!("");
+            //     }
+            //     defmt::info!("{:02x}", byte);
+            // }
+            // defmt::info!("");
 
-        // lora.write_meshtastic_telemetry(temp_celsius, humidity_percent, voltage, packet_id);
-        lora.write();
-        packet_id = packet_id.wrapping_add(1);
+            if let Ok(packet) = lora::meshtastic::parse(&buffer[..len]) {
+                info!(
+                    "Meshtastic: from=0x{:08x}, port={}",
+                    packet.from, packet.channel
+                );
+            } else {
+                warn!("failed to decode message")
+            }
 
-        Timer::after(Duration::from_secs(30)).await;
+            lora.start_rx();
+        }
+
+        Timer::after(Duration::from_millis(100)).await;
     }
 }

@@ -1,37 +1,21 @@
+use alloc::vec;
 use defmt::{error, info};
 use embassy_nrf::{
     gpio::Output,
     spim::{Instance, Spim},
 };
+use meshtastic_protobufs::MeshPacket;
+use prost::Message;
+pub mod meshtastic {
+    use meshtastic_protobufs::MeshPacket;
+    use prost::{DecodeError, Message, bytes::Buf};
 
-pub mod packet {
-    #[repr(C)]
-    pub struct SensorPacket {
-        pub device_id: u8,
-        pub temperature: i16,
-        pub humidity: u16,
-        pub battery_mv: u16,
-        pub counter: u16,
-    }
-
-    impl SensorPacket {
-        pub fn new(device_id: u8) -> Self {
-            Self {
-                device_id,
-                temperature: 0,
-                humidity: 0,
-                battery_mv: 0,
-                counter: 0,
-            }
-        }
-
-        pub fn increment(&mut self) {
-            self.counter = self.counter.wrapping_add(1);
-        }
+    pub fn parse(data: impl Buf) -> Result<MeshPacket, DecodeError> {
+        MeshPacket::decode(data)
     }
 }
 
-const SX1278_FREQ: u32 = 433_200_000;
+const SX1278_FREQ: u32 = 433_875_000;
 
 const REG_OP_MODE: u8 = 0x01;
 const REG_FRF_MSB: u8 = 0x06;
@@ -43,7 +27,6 @@ const REG_LNA: u8 = 0x0C;
 const REG_FIFO_ADDR_PTR: u8 = 0x0D;
 const REG_FIFO_TX_BASE_ADDR: u8 = 0x0E;
 const REG_IRQ_FLAGS: u8 = 0x12;
-const REG_PA_DAC: u8 = 0x4D;
 const REG_MODEM_CONFIG_1: u8 = 0x1D;
 const REG_MODEM_CONFIG_2: u8 = 0x1E;
 const REG_MODEM_CONFIG_3: u8 = 0x26;
@@ -55,9 +38,13 @@ const MODE_STDBY: u8 = 0x01;
 const MODE_TX: u8 = 0x03;
 
 const IRQ_TX_DONE: u8 = 0x08;
-
-const PA_DAC_HIGH: u8 = 0x87;
 const REG_VERSION: u8 = 0x42;
+const REG_RX_NB_BYTES: u8 = 0x13;
+const REG_FIFO_RX_CURRENT: u8 = 0x10;
+const REG_IRQ_FLAGS_MASK: u8 = 0x11;
+const REG_IRQ_FLAGS_RX_DONE: u8 = 0x40;
+const REG_IRQ_FLAGS_VALID_HEADER: u8 = 0x10;
+const REG_RX_TX_ADDR: u8 = 0x4A;
 
 pub struct LoraRadio<'d, T: Instance> {
     nss: Output<'d>,
@@ -112,13 +99,10 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         set_frequency(&mut self.spi, &mut self.nss, SX1278_FREQ);
         info!("Frequency set to {} Hz", SX1278_FREQ);
 
-        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_1, 0x72);
-        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_2, 0x74);
-        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_3, 0x04);
-        info!("LoRa config: BW=125kHz, SF=7, CR=4/5");
-
-        // spi_write(&mut self.spi, &mut self.nss, REG_PA_DAC, PA_DAC_HIGH);
-        // info!("PA_DAC enabled for +20 dBm");
+        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_1, 0b10000010);
+        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_2, 0b10110100);
+        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_3, 0b00000100);
+        info!("LoRa config: BW=250kHz, SF=11, CR=4/5");
 
         spi_write(
             &mut self.spi,
@@ -129,22 +113,152 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         delay(10_000);
     }
 
+    pub fn write_meshtastic_telemetry(
+        &mut self,
+        temp_celsius: f32,
+        humidity_percent: f32,
+        voltage: f32,
+        packet_id: u32,
+    ) {
+        info!(
+            "Sending Meshtastic telemetry: temp={}C, humidity={}%, voltage={}V, id={}",
+            temp_celsius, humidity_percent, voltage, packet_id
+        );
+
+        // tx_packet(&mut self.spi, &mut self.nss, &mhpacket.data[..len]);
+        info!("TX complete");
+    }
+
     pub fn write(&mut self) {
         let packet_count = 1;
         info!("TX packet #{}", packet_count);
         let mut packet_data = [0u8; 16];
 
-        packet_data[0] = (packet_count >> 24) as u8;
-        packet_data[1] = (packet_count >> 16) as u8;
-        packet_data[2] = (packet_count >> 8) as u8;
-        packet_data[3] = packet_count as u8;
+        let packet = MeshPacket {
+            from: 11,
+            to: 445566,
+            channel: 0,
+            id: 11,
+            rx_time: 1,
+            rx_snr: 1.0,
+            hop_limit: 1,
+            want_ack: false,
+            priority: 1,
+            rx_rssi: 1,
+            delayed: 1,
+            via_mqtt: false,
+            hop_start: 1,
+            public_key: vec![],
+            pki_encrypted: true,
+            next_hop: 1,
+            relay_node: 1,
+            tx_after: 1,
+            transport_mechanism: 1,
+            payload_variant: None,
+        };
 
-        for i in 4..16 {
-            packet_data[i] = i as u8;
-        }
-
-        tx_packet(&mut self.spi, &mut self.nss, &packet_data);
+        tx_packet(
+            &mut self.spi,
+            &mut self.nss,
+            packet.encode_to_vec().as_slice(),
+        );
         info!("TX packet #{}.done", packet_count);
+    }
+
+    pub fn start_rx(&mut self) {
+        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
+        spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS_MASK, 0);
+        spi_write(
+            &mut self.spi,
+            &mut self.nss,
+            REG_OP_MODE,
+            MODE_LONG_RANGE | 0x05,
+        );
+        info!("LoRa RX mode started");
+    }
+
+    pub fn check_rx(&mut self) -> Option<(usize, u8)> {
+        let irq_flags = spi_read(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS);
+
+        if irq_flags & REG_IRQ_FLAGS_RX_DONE != 0 {
+            spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS, 0xFF);
+
+            let rx_nb_bytes = spi_read(&mut self.spi, &mut self.nss, REG_RX_NB_BYTES);
+            let fifo_rx_addr = spi_read(&mut self.spi, &mut self.nss, REG_FIFO_RX_CURRENT);
+
+            spi_write(
+                &mut self.spi,
+                &mut self.nss,
+                REG_FIFO_ADDR_PTR,
+                fifo_rx_addr,
+            );
+
+            let mut packet = [0u8; 256];
+            self.nss.set_low();
+            self.spi.blocking_write(&[0x00 | 0x80]).ok();
+            let bytes_read = rx_nb_bytes as usize;
+            self.spi.blocking_read(&mut packet[..bytes_read]).ok();
+            self.nss.set_high();
+
+            info!("RX: {} bytes", bytes_read);
+            for i in 0..bytes_read {
+                if i < 32 {
+                    info!("  [{:02}] = 0x{:02x}", i, packet[i]);
+                }
+            }
+
+            spi_write(
+                &mut self.spi,
+                &mut self.nss,
+                REG_OP_MODE,
+                MODE_LONG_RANGE | MODE_STDBY,
+            );
+
+            Some((bytes_read, packet[0]))
+        } else {
+            None
+        }
+    }
+
+    pub fn receive(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        let irq_flags = spi_read(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS);
+
+        if irq_flags & REG_IRQ_FLAGS_RX_DONE != 0 {
+            spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS, 0xFF);
+
+            let rx_nb_bytes = spi_read(&mut self.spi, &mut self.nss, REG_RX_NB_BYTES);
+            let fifo_rx_addr = spi_read(&mut self.spi, &mut self.nss, REG_FIFO_RX_CURRENT);
+
+            spi_write(
+                &mut self.spi,
+                &mut self.nss,
+                REG_FIFO_ADDR_PTR,
+                fifo_rx_addr,
+            );
+
+            self.nss.set_low();
+            self.spi.blocking_write(&[0x00 | 0x80]).ok();
+            let len = rx_nb_bytes as usize;
+            if len > buffer.len() {
+                self.nss.set_high();
+                return None;
+            }
+            self.spi.blocking_read(&mut buffer[..len]).ok();
+            self.nss.set_high();
+
+            info!("Received {} bytes", len);
+
+            spi_write(
+                &mut self.spi,
+                &mut self.nss,
+                REG_OP_MODE,
+                MODE_LONG_RANGE | MODE_STDBY,
+            );
+
+            Some(len)
+        } else {
+            None
+        }
     }
 }
 
@@ -153,26 +267,46 @@ fn delay(delay: u64) {
 }
 
 fn tx_packet<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>, data: &[u8]) {
+    info!("TX packet .1");
     spi_write(spi, nss, REG_FIFO_ADDR_PTR, 0);
 
+    info!("TX packet .2");
     nss.set_low();
+    info!("TX packet .3");
     spi.blocking_write(&[REG_FIFO_ADDR_PTR as u8 | 0x80]).ok();
+    info!("TX packet .4");
     spi.blocking_write(data).ok();
+    info!("TX packet .5");
     nss.set_high();
 
+    info!("TX packet .5");
     spi_write(spi, nss, REG_PAYLOAD_LENGTH, data.len() as u8);
 
+    info!("TX packet .6");
     spi_write(spi, nss, REG_OP_MODE, MODE_LONG_RANGE | MODE_TX);
 
+    info!("TX packet .7");
     wait_tx_done(spi, nss);
+    info!("TX packet .8");
 }
 
 fn wait_tx_done<'d, T: Instance>(spi: &mut Spim<'d, T>, nss: &mut Output<'d>) {
+    let mut retry = 3;
     loop {
+        if retry < 0 {
+            error!("failed to transmit the data");
+            break;
+        } else {
+            info!("retries left {}", retry);
+            retry -= 1;
+        }
         let irq_flags = spi_read(spi, nss, REG_IRQ_FLAGS);
         if irq_flags & IRQ_TX_DONE != 0 {
+            info!("done transmiting {} {}", irq_flags, irq_flags & IRQ_TX_DONE);
             spi_write(spi, nss, REG_IRQ_FLAGS, IRQ_TX_DONE);
             break;
+        } else {
+            info!("retries left {} flag {}", retry, irq_flags);
         }
     }
 }

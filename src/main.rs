@@ -185,6 +185,7 @@ struct Server {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    bee::init_heap();
     info!("Telemetry Service!");
 
     // First we get the peripherals access crate.

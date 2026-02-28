@@ -33,6 +33,12 @@ atomic-pool = "1.0.1"
 static_cell = "2.0.0"
 nrf-softdevice-s140 = { version = "0.1.2", optional = true }
 crc = "3.4.0"
+embedded-alloc = "0.7"
+
+prost = { version = "0.14.3", default-features = false, features = ["derive"] }
+prost-types = { version = "0.14.3", default-features = false }
+
+meshtastic_protobufs = { path = "../protobufs/packages/rust" }
 
 [profile.release]
 debug = 2
