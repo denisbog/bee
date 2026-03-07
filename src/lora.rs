@@ -8,11 +8,11 @@ use embassy_time::{Duration, Timer};
 use meshtastic_protobufs::MeshPacket;
 use prost::Message;
 pub mod meshtastic {
-    use meshtastic_protobufs::MeshPacket;
+    use meshtastic_protobufs::Data;
     use prost::{DecodeError, Message, bytes::Buf};
 
-    pub fn parse(data: impl Buf) -> Result<MeshPacket, DecodeError> {
-        MeshPacket::decode(data)
+    pub fn parse(data: impl Buf) -> Result<Data, DecodeError> {
+        Data::decode(data)
     }
 }
 
@@ -27,15 +27,16 @@ const REG_PA_RAMP: u8 = 0x0A;
 const REG_LNA: u8 = 0x0C;
 const REG_FIFO_ADDR_PTR: u8 = 0x0D;
 const REG_FIFO_TX_BASE_ADDR: u8 = 0x0E;
+const REG_FIFO_RX_BASE_ADDR: u8 = 0x0F;
 const REG_IRQ_FLAGS: u8 = 0x12;
 const REG_MODEM_CONFIG_1: u8 = 0x1D;
 const REG_MODEM_CONFIG_2: u8 = 0x1E;
 const REG_MODEM_CONFIG_3: u8 = 0x26;
 const REG_PAYLOAD_LENGTH: u8 = 0x22;
 
-const MODE_LONG_RANGE: u8 = 0x80;
-const MODE_SLEEP: u8 = 0x00;
-const MODE_STDBY: u8 = 0x01;
+const MODE_LONG_RANGE: u8 = 0b1000_0000;
+const MODE_SLEEP: u8 = 0b0000_0000;
+const MODE_STDBY: u8 = 0b0000_0001;
 const MODE_TX: u8 = 0x03;
 
 const IRQ_TX_DONE: u8 = 0x08;
@@ -46,6 +47,7 @@ const REG_IRQ_FLAGS_MASK: u8 = 0x11;
 const REG_IRQ_FLAGS_RX_DONE: u8 = 0x40;
 const REG_IRQ_FLAGS_VALID_HEADER: u8 = 0x10;
 const REG_RX_TX_ADDR: u8 = 0x4A;
+const REG_DIO_MAPPING_1: u8 = 0x40;
 
 pub struct LoraRadio<'d, T: Instance> {
     nss: Output<'d>,
@@ -91,6 +93,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         spi_write(&mut self.spi, &mut self.nss, 0x3E, 0x0);
 
         spi_write(&mut self.spi, &mut self.nss, REG_FIFO_TX_BASE_ADDR, 0);
+        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_RX_BASE_ADDR, 0x80);
         spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
 
         spi_write(&mut self.spi, &mut self.nss, REG_LNA, 0x23);
@@ -114,6 +117,16 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         delay(10_000);
     }
 
+    pub fn enable_rx_interrupt(&mut self) {
+        spi_write(
+            &mut self.spi,
+            &mut self.nss,
+            REG_DIO_MAPPING_1,
+            0x00,
+        );
+        info!("LoRa RX interrupt enabled on DIO0");
+    }
+
     pub fn write_meshtastic_telemetry(
         &mut self,
         temp_celsius: f32,
@@ -132,7 +145,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
 
     pub async fn write(&mut self) {
         let packet = MeshPacket {
-            from: 11,
+            from: 1122334455,
             to: 0xFFFFFFFF,
             channel: 0,
             id: 11,
@@ -146,7 +159,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             via_mqtt: false,
             hop_start: 0,
             public_key: vec![],
-            pki_encrypted: true,
+            pki_encrypted: false,
             next_hop: 0,
             relay_node: 0,
             tx_after: 0,
@@ -163,7 +176,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
     }
 
     pub fn start_rx(&mut self) {
-        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
+        // spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0x80);
         spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS_MASK, 0);
         spi_write(
             &mut self.spi,
@@ -234,7 +247,8 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             );
 
             self.nss.set_low();
-            self.spi.blocking_write(&[0x00 | 0x80]).ok();
+            // self.spi.blocking_write(&[0x80]).ok();
+            self.spi.blocking_write(&[0x00]).ok();
             let len = rx_nb_bytes as usize;
             if len > buffer.len() {
                 self.nss.set_high();

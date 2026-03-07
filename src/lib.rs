@@ -15,4 +15,5 @@ pub fn init_heap() {
 
 pub mod aht20;
 pub mod config;
+pub mod decrypt;
 pub mod lora;
