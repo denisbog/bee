@@ -9,14 +9,16 @@ use embassy_nrf::gpio::{AnyPin, Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::gpiote::{InputChannel, InputChannelPolarity};
 use embassy_nrf::interrupt::{InterruptExt, Priority};
 use embassy_nrf::{self as _, interrupt, spim};
+use meshtastic_protobufs::{PortNum, Telemetry};
 use nrf_softdevice as _;
 use panic_probe as _;
 
-use defmt::info;
+use defmt::{debug, info, trace, warn};
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::config::Config;
 use embassy_nrf::peripherals::{GPIOTE_CH0, SPI3};
+use prost::Message;
 
 bind_interrupts!(struct Irqs {
     SPIM3 => spim::InterruptHandler<SPI3>;
@@ -88,31 +90,82 @@ async fn main(_spawner: Spawner) {
 
     loop {
         channel.wait().await;
-        info!("RX interrupt triggered!");
+        debug!("RX interrupt triggered!");
 
         if let Some(len) = lora.receive(&mut buffer) {
             packet_count += 1;
             info!("=== Packet #{} ({} bytes) ===", packet_count, len);
-            info!("plain");
+            debug!("plain");
             print_to_hex(&buffer, len);
             if len > 16 {
-                let header = parse_packet_header(&buffer[..len]).unwrap();
-                info!("parsed");
-                print_to_hex(&header.encrypted_payload, header.encrypted_payload.len());
-                let result = decrypt_aes_ctr(
-                    &DEFAULT_KEY,
-                    header.from_node,
-                    header.packet_id,
-                    &header.encrypted_payload,
-                )
-                .unwrap();
-                info!("decoded");
-                print_to_hex(&result, result.len());
-                if let Ok(message) = meshtastic::parse(&result[..result.len()]) {
-                    info!("decoded {}", str::from_utf8(&message.payload).unwrap());
-                };
+                if let Ok(header) = parse_packet_header(&buffer[..len]) {
+                    debug!("parsed");
+                    print_to_hex(&header.encrypted_payload, header.encrypted_payload.len());
+                    if let Ok(result) = decrypt_aes_ctr(
+                        &DEFAULT_KEY,
+                        header.from_node,
+                        header.packet_id,
+                        &header.encrypted_payload,
+                    ) {
+                        debug!("decoded");
+                        print_to_hex(&result, result.len());
+
+                        debug!("try to parse the packet");
+
+                        if let Ok(message) = meshtastic::parse(result.as_slice()) {
+                            info!("port num {}", message.portnum);
+                            match message.portnum() {
+                                PortNum::TelemetryApp => {
+                                    if let Ok(telemetry) =
+                                        Telemetry::decode(message.payload.as_slice())
+                                    {
+                                        if let Some(variant) = telemetry.variant {
+                                            match variant {
+                                                meshtastic_protobufs::telemetry::Variant::DeviceMetrics(device_metrics) => {
+                                                  if let Some (battery) = device_metrics.battery_level {
+                                    info!("------- telemetry app battery {}", battery);
+                                                  }
+                                                },
+                                                meshtastic_protobufs::telemetry::Variant::EnvironmentMetrics(environment_metrics) => {
+                                    info!("------- telemetry app temperature {} humidity {}", environment_metrics.temperature, environment_metrics.relative_humidity);
+                                                },
+                                                _=> {}
+                                            };
+                                        } else {
+                                            warn!("variant not provided");
+                                        }
+                                    } else {
+                                        warn!("failed to decode telemetry data");
+                                    };
+                                    // info!("telemetry app {:x}", message.payload.as_slice());
+                                }
+                                PortNum::TextMessageApp => {
+                                    if let Ok(message) = str::from_utf8(message.payload.as_slice())
+                                    {
+                                       info!("------- message {}", message);
+                                    } else {
+                                        warn!(
+                                            "failed to read the message {:02x}",
+                                            message.payload.as_slice()
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    debug!("unrecognized packet decoded {:x}", message.payload.as_slice());
+                                }
+                            };
+                        } else {
+                            // info!("failed to decode the packet {:x}", result.as_slice());
+                            info!("failed to decode the packet");
+                        };
+                    } else {
+                        warn!("failed to decrypt");
+                    }
+                } else {
+                    warn!("failed to decode header");
+                }
             }
-            info!("=== Packet #{} ({} bytes).end ===", packet_count, len);
+            debug!("=== Packet #{} ({} bytes).end ===", packet_count, len);
             lora.start_rx();
         }
     }
@@ -126,6 +179,6 @@ async fn main(_spawner: Spawner) {
             hex[pos + 1] = hex_chars[(byte & 0xf) as usize];
             pos += 2;
         }
-        info!("Hex: {}", core::str::from_utf8(&hex[..pos]).unwrap());
+        trace!("Hex: {}", core::str::from_utf8(&hex[..pos]).unwrap());
     }
 }
