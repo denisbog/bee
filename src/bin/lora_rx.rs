@@ -115,6 +115,17 @@ async fn main(_spawner: Spawner) {
                         if let Ok(message) = meshtastic::parse(result.as_slice()) {
                             info!("port num {}", message.portnum);
                             match message.portnum() {
+                                PortNum::PositionApp => {
+                                    if let Ok(position) =
+                                        Position::decode(message.payload.as_slice())
+                                    {
+                                        info!(
+                                            "------- telemetry location lat {} long {}",
+                                            position.latitude_i(),
+                                            position.longitude_i()
+                                        );
+                                    };
+                                }
                                 PortNum::TelemetryApp => {
                                     if let Ok(telemetry) =
                                         Telemetry::decode(message.payload.as_slice())

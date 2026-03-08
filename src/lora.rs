@@ -293,6 +293,10 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS, 0xFF);
 
             let rx_nb_bytes = spi_read(&mut self.spi, &mut self.nss, REG_RX_NB_BYTES);
+            let len = rx_nb_bytes as usize;
+            if len > buffer.len() {
+                return None;
+            }
             let fifo_rx_addr = spi_read(&mut self.spi, &mut self.nss, REG_FIFO_RX_CURRENT);
 
             spi_write(
@@ -303,15 +307,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             );
 
             self.nss.set_low();
-            // self.spi.blocking_write(&[0x80]).ok();
-            self.spi.blocking_write(&[0x00]).ok();
-            let len = rx_nb_bytes as usize;
-            if len > buffer.len() {
-                self.nss.set_high();
-                return None;
-            }
-
-            self.nss.set_low();
+            //TODO: why is required to write 00
             self.spi.blocking_write(&[0x00]).ok();
             let _ = self.spi.blocking_read(&mut buffer[..len]).ok();
             self.nss.set_high();
