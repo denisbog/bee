@@ -18,6 +18,7 @@ pub mod meshtastic {
 
 const SX1278_FREQ: u32 = 433_875_000;
 
+const SYNC_WORD_VALUE: u8 = 0x2B;
 const REG_OP_MODE: u8 = 0x01;
 const REG_FRF_MSB: u8 = 0x06;
 const REG_FRF_MID: u8 = 0x07;
@@ -38,6 +39,7 @@ const MODE_LONG_RANGE: u8 = 0b1000_0000;
 const MODE_SLEEP: u8 = 0b0000_0000;
 const MODE_STDBY: u8 = 0b0000_0001;
 const MODE_TX: u8 = 0x03;
+const MODE_RX_CONTINUOUS: u8 = 0b0000_0101;
 
 const IRQ_TX_DONE: u8 = 0x08;
 const REG_VERSION: u8 = 0x42;
@@ -48,6 +50,12 @@ const REG_IRQ_FLAGS_RX_DONE: u8 = 0x40;
 const REG_IRQ_FLAGS_VALID_HEADER: u8 = 0x10;
 const REG_RX_TX_ADDR: u8 = 0x4A;
 const REG_DIO_MAPPING_1: u8 = 0x40;
+const REG_SYNC_WORD: u8 = 0x39;
+const REG_PREAMBLE_MSB: u8 = 0x20;
+const REG_PREAMBLE_LSB: u8 = 0x21;
+const REG_RSSI_VALUE: u8 = 0x1B;
+const REG_PKT_SNR_VALUE: u8 = 0x19;
+const REG_MODEM_STATUS: u8 = 0x18;
 
 pub struct LoraRadio<'d, T: Instance> {
     nss: Output<'d>,
@@ -88,6 +96,13 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         );
         delay(10_000);
 
+        spi_write(&mut self.spi, &mut self.nss, REG_SYNC_WORD, SYNC_WORD_VALUE);
+        let sync_word = spi_read(&mut self.spi, &mut self.nss, REG_SYNC_WORD);
+        info!(
+            "Sync word set to 0x{:02x}, read back: 0x{:02x}",
+            SYNC_WORD_VALUE, sync_word
+        );
+
         spi_write(&mut self.spi, &mut self.nss, 0x31, 0x18);
         spi_write(&mut self.spi, &mut self.nss, 0x2E, 0x0);
         spi_write(&mut self.spi, &mut self.nss, 0x3E, 0x0);
@@ -96,17 +111,25 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         spi_write(&mut self.spi, &mut self.nss, REG_FIFO_RX_BASE_ADDR, 0x80);
         spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
 
-        spi_write(&mut self.spi, &mut self.nss, REG_LNA, 0x23);
-        spi_write(&mut self.spi, &mut self.nss, REG_PA_RAMP, 0x09);
-        spi_write(&mut self.spi, &mut self.nss, REG_PA_CONFIG, 0xFF);
+        spi_write(&mut self.spi, &mut self.nss, REG_LNA, 0b11000111);
+        // spi_write(&mut self.spi, &mut self.nss, REG_PA_RAMP, 0x09);
+        // spi_write(&mut self.spi, &mut self.nss, REG_PA_CONFIG, 0xFF);
 
         set_frequency(&mut self.spi, &mut self.nss, SX1278_FREQ);
         info!("Frequency set to {} Hz", SX1278_FREQ);
 
-        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_1, 0b10000010);
+        spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_1, 0b10000000);
         spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_2, 0b10110100);
         spi_write(&mut self.spi, &mut self.nss, REG_MODEM_CONFIG_3, 0b00000100);
-        info!("LoRa config: BW=250kHz, SF=11, CR=4/5");
+        info!("LoRa config: BW=250kHz, SF=11, CR=4/5, Explicit Header");
+
+        spi_write(&mut self.spi, &mut self.nss, REG_PREAMBLE_MSB, 0x00);
+        spi_write(&mut self.spi, &mut self.nss, REG_PREAMBLE_LSB, 0x08);
+        info!("Preamble set to 8 bytes");
+
+        let rssi = spi_read(&mut self.spi, &mut self.nss, REG_RSSI_VALUE);
+        let modem_status = spi_read(&mut self.spi, &mut self.nss, REG_MODEM_STATUS);
+        info!("RSSI raw: {}, ModemStatus: {:b}", rssi, modem_status);
 
         spi_write(
             &mut self.spi,
@@ -118,13 +141,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
     }
 
     pub fn enable_rx_interrupt(&mut self) {
-        spi_write(
-            &mut self.spi,
-            &mut self.nss,
-            REG_DIO_MAPPING_1,
-            0x00,
-        );
-        info!("LoRa RX interrupt enabled on DIO0");
+        spi_write(&mut self.spi, &mut self.nss, REG_DIO_MAPPING_1, 0x00);
     }
 
     pub fn write_meshtastic_telemetry(
@@ -176,15 +193,36 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
     }
 
     pub fn start_rx(&mut self) {
-        // spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0x80);
+        spi_write(&mut self.spi, &mut self.nss, REG_SYNC_WORD, SYNC_WORD_VALUE);
+        let sync_word = spi_read(&mut self.spi, &mut self.nss, REG_SYNC_WORD);
+        if sync_word != SYNC_WORD_VALUE {
+            error!(
+                "Sync word does not match expected: 0x{:02x} got: 0x{:02x}, retry",
+                SYNC_WORD_VALUE, sync_word
+            );
+            //retry
+            spi_write(&mut self.spi, &mut self.nss, REG_SYNC_WORD, SYNC_WORD_VALUE);
+            let sync_word = spi_read(&mut self.spi, &mut self.nss, REG_SYNC_WORD);
+            if sync_word != SYNC_WORD_VALUE {
+                error!(
+                    "Sync word does not match expected: 0x{:02x} got: 0x{:02x}",
+                    SYNC_WORD_VALUE, sync_word
+                );
+            }
+        }
+        info!("Starting RX. Sync word: 0x{:02x}", sync_word);
+
         spi_write(&mut self.spi, &mut self.nss, REG_IRQ_FLAGS_MASK, 0);
         spi_write(
             &mut self.spi,
             &mut self.nss,
             REG_OP_MODE,
-            MODE_LONG_RANGE | 0x05,
+            MODE_LONG_RANGE | MODE_RX_CONTINUOUS,
         );
-        info!("LoRa RX mode started");
+
+        let rssi = spi_read(&mut self.spi, &mut self.nss, REG_RSSI_VALUE);
+        let modem = spi_read(&mut self.spi, &mut self.nss, REG_MODEM_STATUS);
+        info!("RX started. RSSI: {}, Modem: {:b}", rssi, modem);
     }
 
     pub fn check_rx(&mut self) -> Option<(usize, u8)> {
@@ -196,6 +234,15 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             let rx_nb_bytes = spi_read(&mut self.spi, &mut self.nss, REG_RX_NB_BYTES);
             let fifo_rx_addr = spi_read(&mut self.spi, &mut self.nss, REG_FIFO_RX_CURRENT);
 
+            let pkt_snr = spi_read(&mut self.spi, &mut self.nss, REG_PKT_SNR_VALUE);
+            let pkt_rssi = spi_read(&mut self.spi, &mut self.nss, 0x1A);
+            info!(
+                "RX: {} bytes, SNR: {}, Rssi: {}",
+                rx_nb_bytes,
+                pkt_snr as i8 / 4,
+                pkt_rssi as i8 as i16 - 164
+            );
+
             spi_write(
                 &mut self.spi,
                 &mut self.nss,
@@ -204,10 +251,16 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             );
 
             let mut packet = [0u8; 256];
-            self.nss.set_low();
-            self.spi.blocking_write(&[0x00 | 0x80]).ok();
             let bytes_read = rx_nb_bytes as usize;
-            self.spi.blocking_read(&mut packet[..bytes_read]).ok();
+
+            self.nss.set_low();
+            self.spi.blocking_write(&[REG_FIFO_ADDR_PTR]).ok();
+            self.spi.blocking_write(&[fifo_rx_addr]).ok();
+            self.nss.set_high();
+
+            self.nss.set_low();
+            self.spi.blocking_write(&[REG_FIFO_ADDR_PTR]).ok();
+            let _ = self.spi.blocking_read(&mut packet[..bytes_read]).ok();
             self.nss.set_high();
 
             info!("RX: {} bytes", bytes_read);
@@ -225,6 +278,9 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             );
 
             Some((bytes_read, packet[0]))
+        } else if irq_flags != 0 {
+            info!("IRQ flags: {:#04x}", irq_flags);
+            None
         } else {
             None
         }
@@ -254,7 +310,10 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
                 self.nss.set_high();
                 return None;
             }
-            self.spi.blocking_read(&mut buffer[..len]).ok();
+
+            self.nss.set_low();
+            self.spi.blocking_write(&[0x00]).ok();
+            let _ = self.spi.blocking_read(&mut buffer[..len]).ok();
             self.nss.set_high();
 
             info!("Received {} bytes", len);
