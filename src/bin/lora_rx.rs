@@ -9,7 +9,7 @@ use embassy_nrf::gpio::{AnyPin, Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::gpiote::{InputChannel, InputChannelPolarity};
 use embassy_nrf::interrupt::{InterruptExt, Priority};
 use embassy_nrf::{self as _, interrupt, spim};
-use meshtastic_protobufs::{PortNum, Telemetry};
+use meshtastic_protobufs::{PortNum, Position, Telemetry};
 use nrf_softdevice as _;
 use panic_probe as _;
 
@@ -49,7 +49,6 @@ fn init_lora<'a>(
     }
 
     let channel = InputChannel::new(gpiote_ch0, dio0, InputChannelPolarity::LoToHi);
-    lora.enable_rx_interrupt();
 
     (lora, channel)
 }
@@ -153,7 +152,7 @@ async fn main(_spawner: Spawner) {
                                 PortNum::TextMessageApp => {
                                     if let Ok(message) = str::from_utf8(message.payload.as_slice())
                                     {
-                                       info!("------- message {}", message);
+                                        info!("------- message {}", message);
                                     } else {
                                         warn!(
                                             "failed to read the message {:02x}",
@@ -162,7 +161,10 @@ async fn main(_spawner: Spawner) {
                                     }
                                 }
                                 _ => {
-                                    debug!("unrecognized packet decoded {:x}", message.payload.as_slice());
+                                    debug!(
+                                        "unrecognized packet decoded {:x}",
+                                        message.payload.as_slice()
+                                    );
                                 }
                             };
                         } else {
@@ -177,7 +179,7 @@ async fn main(_spawner: Spawner) {
                 }
             }
             debug!("=== Packet #{} ({} bytes).end ===", packet_count, len);
-            lora.start_rx();
+            // lora.start_rx();
         }
     }
 
