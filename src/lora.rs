@@ -99,26 +99,7 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         );
         delay(20_000);
 
-        let optimized = spi_read(&mut self.spi, &mut self.nss, 0x31);
-        info!("optimized {:#010b}", optimized);
-        spi_write(&mut self.spi, &mut self.nss, 0x31, 0b0001_1000);
-        // spi_write(&mut self.spi, &mut self.nss, 0x31, 0b0100_0011);
-        let optimized = spi_read(&mut self.spi, &mut self.nss, 0x31);
-        info!("optimized {:#010b}", optimized);
-        // spi_write(&mut self.spi, &mut self.nss, 0x2E, 0b0000_0000);
-
-        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_TX_BASE_ADDR, 0);
-        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_RX_BASE_ADDR, 0x0);
-        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
-
-        spi_write(&mut self.spi, &mut self.nss, REG_LNA, 0b11000111);
-        // spi_write(&mut self.spi, &mut self.nss, REG_PA_RAMP, 0x09);
-        // spi_write(&mut self.spi, &mut self.nss, REG_PA_CONFIG, 0xFF);
-
-        set_frequency(&mut self.spi, &mut self.nss, SX1278_FREQ);
-        info!("Frequency set to {} Hz", SX1278_FREQ);
-
-        spi_write(
+       spi_write(
             &mut self.spi,
             &mut self.nss,
             REG_MODEM_CONFIG_1,
@@ -130,7 +111,28 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
             REG_MODEM_CONFIG_2,
             0b1011_0100,
         );
+        spi_write(
+            &mut self.spi,
+            &mut self.nss,
+            REG_MODEM_CONFIG_3,
+            0b0000_0100,
+        );
+
         info!("LoRa config: BW=250kHz, SF=11, CR=4/5, Explicit Header");
+        spi_write(&mut self.spi, &mut self.nss, 0x31, 0b1100_0000);
+        let optimized = spi_read(&mut self.spi, &mut self.nss, 0x31);
+        info!("optimized {:#010b}", optimized);
+
+        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_TX_BASE_ADDR, 0);
+        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_RX_BASE_ADDR, 0x0);
+        spi_write(&mut self.spi, &mut self.nss, REG_FIFO_ADDR_PTR, 0);
+
+        spi_write(&mut self.spi, &mut self.nss, REG_LNA, 0b11000111);
+        // spi_write(&mut self.spi, &mut self.nss, REG_PA_RAMP, 0x09);
+        // spi_write(&mut self.spi, &mut self.nss, REG_PA_CONFIG, 0xFF);
+
+        set_frequency(&mut self.spi, &mut self.nss, SX1278_FREQ);
+        info!("Frequency set to {} Hz", SX1278_FREQ);
 
         // spi_write(&mut self.spi, &mut self.nss, REG_PREAMBLE_MSB, 0x00);
         // spi_write(&mut self.spi, &mut self.nss, REG_PREAMBLE_LSB, 0x08);
