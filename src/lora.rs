@@ -119,7 +119,9 @@ impl<'d, T: Instance> LoraRadio<'d, T> {
         );
 
         info!("LoRa config: BW=250kHz, SF=11, CR=4/5, Explicit Header");
-        spi_write(&mut self.spi, &mut self.nss, 0x31, 0b1100_0000);
+        let optimized = spi_read(&mut self.spi, &mut self.nss, 0x31);
+        // disable detection optimization
+        spi_write(&mut self.spi, &mut self.nss, 0x31, optimized & 0xF8);
         let optimized = spi_read(&mut self.spi, &mut self.nss, 0x31);
         info!("optimized {:#010b}", optimized);
 
